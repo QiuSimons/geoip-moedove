@@ -1,0 +1,194 @@
+name: Update GeoIP
+
+on:
+  schedule:
+    - cron: '30 20 * * *' # 每天凌晨 04:30(北京时间) 自动拉取执行
+  workflow_dispatch: # 额外允许你在网页上手动点运行
+
+jobs:
+  update-geoip:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 给 Bot 推送修改代码的权限
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1 # 只拉一层，保持 clone 极快
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests protobuf grpcio-tools
+
+      - name: Run Update Script
+        run: |
+          # 这一段让 Python 运行并留在 CI runner 内存里，执行完脚本自行销毁，保证仓库里绝对干干净净。
+          cat << 'EOF' > update_geoip.py
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+
+          import os
+          import sys
+          import tempfile
+          import shutil
+          import logging
+          import ipaddress
+          import subprocess
+          import requests
+
+          logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+          GEOIP_URL = "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"
+          IP_SOURCES = [
+              "https://cira.moedove.com/china_all_v4.txt",
+              "https://cira.moedove.com/china_all_v6.txt"
+          ]
+
+          def setup_protobuf(tmpdir):
+              logging.info("Building V2Ray Protobuf protocol...")
+              proto_file = os.path.join(tmpdir, "geoip.proto")
+              proto_content = """syntax = "proto3";
+          message CIDR {
+            bytes ip = 1;
+            uint32 prefix = 2;
+          }
+          message GeoIP {
+            string country_code = 1;
+            repeated CIDR cidr = 2;
+            bool reverse_match = 3;
+          }
+          message GeoIPList {
+            repeated GeoIP entry = 1;
+          }
+          """
+              with open(proto_file, "w") as f:
+                  f.write(proto_content)
+              
+              cmd = [sys.executable, "-m", "grpc_tools.protoc", f"-I{tmpdir}", f"--python_out={tmpdir}", proto_file]
+              subprocess.run(cmd, check=True)
+              
+              sys.path.insert(0, tmpdir)
+              import geoip_pb2
+              return geoip_pb2
+
+          def download_geoip(url, target_path, timeout=15):
+              headers = {}
+              current_size = 0
+              if os.path.exists(target_path):
+                  current_size = os.path.getsize(target_path)
+                  headers['Range'] = f'bytes={current_size}-'
+
+              resp = requests.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True)
+              if resp.status_code == 416: return
+              resp.raise_for_status()
+              mode = 'ab' if resp.status_code == 206 else 'wb'
+
+              with open(target_path, mode) as f:
+                  for chunk in resp.iter_content(chunk_size=8192):
+                      if chunk: f.write(chunk)
+                      
+              expected_length = resp.headers.get('content-length')
+              if expected_length:
+                  expected_size = int(expected_length) + (current_size if resp.status_code == 206 else 0)
+                  actual_size = os.path.getsize(target_path)
+                  if actual_size != expected_size:
+                      raise EOFError(f"Size mismatch! Expected: {expected_size}, Got: {actual_size}")
+
+          def fetch_and_clean_ips(urls):
+              valid_networks = set()
+              for url in urls:
+                  resp = requests.get(url, timeout=10)
+                  resp.raise_for_status()
+                  for line in resp.text.splitlines():
+                      line = line.split('#')[0].strip()
+                      if not line: continue
+                      try: valid_networks.add(ipaddress.ip_network(line, strict=False))
+                      except ValueError: pass
+              return valid_networks
+
+          def process_and_verify_geoip(pb2, raw_dat_path, new_dat_path, custom_networks):
+              geoip_list = pb2.GeoIPList()
+              with open(raw_dat_path, 'rb') as f:
+                  geoip_list.ParseFromString(f.read())
+                  
+              new_cidrs = []
+              for net in sorted(custom_networks, key=lambda x: (x.version, x.network_address)):
+                  cidr = pb2.CIDR()
+                  cidr.ip = net.network_address.packed
+                  cidr.prefix = net.prefixlen
+                  new_cidrs.append(cidr)
+                  
+              replaced = False
+              for entry in geoip_list.entry:
+                  if entry.country_code.upper() == 'CN':
+                      del entry.cidr[:]
+                      entry.cidr.extend(new_cidrs)
+                      replaced = True
+                      break
+                      
+              if not replaced:
+                  new_entry = geoip_list.entry.add()
+                  new_entry.country_code = 'CN'
+                  new_entry.cidr.extend(new_cidrs)
+                  
+              result_bytes = geoip_list.SerializeToString()
+              with open(new_dat_path, 'wb') as f: f.write(result_bytes)
+                  
+              verify_list = pb2.GeoIPList()
+              with open(new_dat_path, 'rb') as f:
+                  verify_list.ParseFromString(f.read())
+                  
+              extracted_networks = set()
+              for entry in verify_list.entry:
+                  if entry.country_code.upper() == 'CN':
+                      for cidr in entry.cidr:
+                          extracted_networks.add(ipaddress.ip_network((cidr.ip, cidr.prefix), strict=False))
+                          
+              if extracted_networks != custom_networks:
+                  missing = custom_networks - extracted_networks
+                  redundant = extracted_networks - custom_networks
+                  raise ValueError(f"Verify Failed! Missing: {len(missing)}, Redundant: {len(redundant)}")
+
+          def main():
+              target_final_file = "geoip.dat"
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  try:
+                      pb_module = setup_protobuf(tmpdir)
+                      raw_dat_path = os.path.join(tmpdir, "raw_geoip.dat")
+                      new_dat_path = os.path.join(tmpdir, "new_geoip.dat")
+                      download_geoip(GEOIP_URL, raw_dat_path)
+                      custom_ips = fetch_and_clean_ips(IP_SOURCES)
+                      process_and_verify_geoip(pb_module, raw_dat_path, new_dat_path, custom_ips)
+                      shutil.move(new_dat_path, target_final_file)
+                      logging.info("GeoIP update complete.")
+                  except Exception as e:
+                      logging.error(f"Failed: {str(e)}")
+                      sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          python3 update_geoip.py
+          rm update_geoip.py # 执行完成后立刻删除，不往仓库里提
+
+      - name: Commit and Push
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add geoip.dat
+          
+          # 如果两次生成的 dat 完全一样，这一步会安静退出，防止刷重复 commit
+          if git diff --staged --quiet; then
+            echo "No changes in geoip.dat to commit."
+          else
+            git commit -m "chore: Auto update geoip.dat [$(date +'%Y-%m-%d')]"
+            git push
+          fi
