@@ -47,8 +47,8 @@ jobs:
 
           GEOIP_URL = "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"
           IP_SOURCES = [
-              "https://cira.moedove.com/china_all_v4.txt",
-              "https://cira.moedove.com/china_all_v6.txt"
+              "https://cira.moedove.com/china_domestic_backbone_v4.txt",
+              "https://cira.moedove.com/china_domestic_backbone_v6.txt"
           ]
 
           def setup_protobuf(tmpdir):
