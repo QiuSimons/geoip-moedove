@@ -2,20 +2,20 @@ name: Update GeoIP
 
 on:
   schedule:
-    - cron: '30 20 * * *' # 每天凌晨 04:30(北京时间) 自动拉取执行
-  workflow_dispatch: # 额外允许你在网页上手动点运行
+    - cron: '34 19 * * *'
+  workflow_dispatch:
 
 jobs:
   update-geoip:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 给 Bot 推送修改代码的权限
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1 # 只拉一层，保持 clone 极快
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,9 +27,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests protobuf grpcio-tools
 
-      - name: Run Update Script
+      - name: Run update script
         run: |
-          # 这一段让 Python 运行并留在 CI runner 内存里，执行完脚本自行销毁，保证仓库里绝对干干净净。
           cat << 'EOF' > update_geoip.py
           #!/usr/bin/env python3
           # -*- coding: utf-8 -*-
@@ -177,18 +176,17 @@ jobs:
           EOF
 
           python3 update_geoip.py
-          rm update_geoip.py # 执行完成后立刻删除，不往仓库里提
+          rm -f update_geoip.py
 
-      - name: Commit and Push
+      - name: Commit and push changes
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add geoip.dat
-          
-          # 如果两次生成的 dat 完全一样，这一步会安静退出，防止刷重复 commit
+
           if git diff --staged --quiet; then
             echo "No changes in geoip.dat to commit."
           else
-            git commit -m "chore: Auto update geoip.dat [$(date +'%Y-%m-%d')]"
-            git push
+            git commit -m "chore: auto update geoip.dat [$(date +'%Y-%m-%d')]"
+            git push origin main
           fi
